@@ -36,13 +36,13 @@ def run_slack_app():
     import subprocess
     subprocess.run(["python", "main.py"])
 
+# Start Slack app when this module is imported
+slack_thread = threading.Thread(target=run_slack_app, daemon=True)
+slack_thread.start()
+logger.info("Slack app thread started")
+
 if __name__ == "__main__":
-    # Start Slack app in a separate thread
-    slack_thread = threading.Thread(target=run_slack_app, daemon=True)
-    slack_thread.start()
-    logger.info("Slack app thread started")
-    
-    # Run Flask app for health checks on Render's port
+    # For development only - production uses gunicorn
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"Starting health check server on port {port}")
     health_app.run(host="0.0.0.0", port=port)
