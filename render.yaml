@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: chatgpt-in-slack
+    runtime: node
+    repo: https://github.com/SYPartners/ChatGPT-in-Slack.git
+    branch: main
+    buildCommand: "npm install"
+    startCommand: "node app.js"
+    healthCheckPath: /healthz
+    envVars:
+      - fromGroup: chatgpt-in-slack-env
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: chatgpt-redis
+
+databases:
+  - name: chatgpt-redis
+    type: redis
+    plan: free
+EOF < /dev/null
