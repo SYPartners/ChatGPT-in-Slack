@@ -2,14 +2,14 @@ services:
   - type: web
     name: chatgpt-in-slack
     env: production
-    runtime: node
+    runtime: python
     repo: https://github.com/SYPartners/ChatGPT-in-Slack.git
     branch: main
     region: virginia  # Virginia, USA
     plan: starter
-    buildCommand: "npm install"
-    startCommand: "node app.js"
-    healthCheckPath: /healthz
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main_prod.py"
+    healthCheckPath: /slack/events
     envVars:
       - key: REDIS_URL
         fromService:
