@@ -20,7 +20,6 @@ services:
 
   - type: redis
     name: chatgpt-redis
-    env: production
     region: virginia  # Virginia, USA
     plan: starter
     ipAllowList: []  # Allow connections from all IPs
