@@ -8,7 +8,8 @@ services:
     region: virginia  # Virginia, USA
     plan: starter
     buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
+    startCommand: "python render_app.py"
+    healthCheckPath: /healthz
     envVars:
       - key: REDIS_URL
         fromService:
