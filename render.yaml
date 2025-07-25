@@ -4,6 +4,8 @@ services:
     runtime: node
     repo: https://github.com/SYPartners/ChatGPT-in-Slack.git
     branch: main
+    region: virginia  # Virginia, USA
+    plan: starter
     buildCommand: "npm install"
     startCommand: "node app.js"
     healthCheckPath: /healthz
@@ -13,9 +15,10 @@ services:
         fromService:
           type: redis
           name: chatgpt-redis
+          property: connectionString
 
-databases:
-  - name: chatgpt-redis
-    type: redis
-    plan: free
-EOF < /dev/null
+  - type: redis
+    name: chatgpt-redis
+    region: virginia  # Virginia, USA
+    plan: starter
+    ipAllowList: []  # Allow connections from all IPs
