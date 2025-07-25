@@ -9,7 +9,6 @@ import os
 import threading
 import logging
 from flask import Flask, make_response, request
-from main import app, SocketModeHandler
 
 # Create Flask app for health checks only
 health_app = Flask(__name__)
@@ -33,8 +32,9 @@ def block_all_other_requests(path=None):
 def run_slack_app():
     """Run the Slack Socket Mode app in a separate thread"""
     logger.info("Starting Slack Socket Mode app...")
-    handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
-    handler.start()
+    # Import and run main.py directly
+    import subprocess
+    subprocess.run(["python", "main.py"])
 
 if __name__ == "__main__":
     # Start Slack app in a separate thread
