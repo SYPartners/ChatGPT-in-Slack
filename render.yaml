@@ -1,6 +1,7 @@
 services:
   - type: web
     name: chatgpt-in-slack
+    env: production
     runtime: node
     repo: https://github.com/SYPartners/ChatGPT-in-Slack.git
     branch: main
@@ -19,6 +20,7 @@ services:
 
   - type: redis
     name: chatgpt-redis
+    env: production
     region: virginia  # Virginia, USA
     plan: starter
     ipAllowList: []  # Allow connections from all IPs
