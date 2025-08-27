@@ -17,39 +17,16 @@ from slack_sdk.web import WebClient, SlackResponse
 from app.markdown_conversion import slack_to_markdown, markdown_to_slack
 from app.openai_constants import (
     MAX_TOKENS,
-    GPT_3_5_TURBO_MODEL,
-    GPT_3_5_TURBO_0301_MODEL,
-    GPT_3_5_TURBO_0613_MODEL,
-    GPT_3_5_TURBO_1106_MODEL,
-    GPT_3_5_TURBO_0125_MODEL,
-    GPT_3_5_TURBO_16K_MODEL,
-    GPT_3_5_TURBO_16K_0613_MODEL,
-    GPT_4_MODEL,
-    GPT_4_0314_MODEL,
-    GPT_4_0613_MODEL,
-    GPT_4_1106_PREVIEW_MODEL,
-    GPT_4_0125_PREVIEW_MODEL,
-    GPT_4_TURBO_PREVIEW_MODEL,
-    GPT_4_TURBO_MODEL,
-    GPT_4_TURBO_2024_04_09_MODEL,
-    GPT_4_32K_MODEL,
-    GPT_4_32K_0314_MODEL,
-    GPT_4_32K_0613_MODEL,
-    GPT_4O_MODEL,
-    GPT_4O_2024_05_13_MODEL,
-    GPT_4O_MINI_MODEL,
-    GPT_4O_MINI_2024_07_18_MODEL,
-    GPT_4_1_MODEL,
-    GPT_4_1_2025_04_14_MODEL,
-    GPT_4_1_MINI_MODEL,
-    GPT_4_1_MINI_2025_04_14_MODEL,
-    GPT_4_1_NANO_MODEL,
-    GPT_4_1_NANO_2025_04_14_MODEL,
-    GPT_5_CHAT_LATEST_MODEL,
     MODEL_TOKENS,
-    MODEL_FALLBACKS,
+    MODEL_CONTEXT_LENGTHS,
+    resolve_model_alias,
+    DEFAULT_TOKEN_COUNT_MODEL,
 )
 from app.slack_ops import update_wip_message
+from app.slack_constants import REASONING_EMPTY_OUTPUT_HINT
+
+# Local budget for function-call prompt token estimation
+FUNCTION_CALL_TOKEN_BUDGET = 1024
 
 # ----------------------------
 # Internal functions
@@ -87,7 +64,9 @@ def messages_within_context_window(
     if context.get("OPENAI_FUNCTION_CALL_MODULE_NAME") is not None:
         max_context_tokens -= calculate_tokens_necessary_for_function_call(context)
     num_context_tokens = 0  # Number of tokens in the context window just before the earliest message is deleted
-    while (num_tokens := calculate_num_tokens(messages)) > max_context_tokens:
+    while (
+        num_tokens := calculate_num_tokens(messages, model=context.get("OPENAI_MODEL"))
+    ) > max_context_tokens:
         removed = False
         for i, message in enumerate(messages):
             if message["role"] in ("user", "assistant", "function"):
@@ -102,6 +81,25 @@ def messages_within_context_window(
         num_context_tokens = num_tokens
 
     return messages, num_context_tokens, max_context_tokens
+
+
+def _is_reasoning(model: str) -> bool:
+    """Returns True if the model is a reasoning model under Chat Completions.
+
+    Excludes chat models like gpt-5-chat-latest. Matches o3*, o4*, and
+    non-chat gpt-5* families. Case-insensitive and safe with None/empty.
+    """
+    if not model:
+        return False
+    ml = model.lower()
+    if ml.startswith("gpt-5-chat"):
+        return False
+    return (
+        ml.startswith("o1")
+        or ml.startswith("o3")
+        or ml.startswith("o4")
+        or ml.startswith("gpt-5")
+    )
 
 
 def make_synchronous_openai_call(
@@ -131,19 +129,31 @@ def make_synchronous_openai_call(
             base_url=openai_api_base,
             organization=openai_organization_id,
         )
-    return client.chat.completions.create(
+    # Some reasoning models require max_completion_tokens instead of max_tokens
+
+    token_kwarg = (
+        {"max_completion_tokens": MAX_TOKENS}
+        if _is_reasoning(model)
+        else {"max_tokens": MAX_TOKENS}
+    )
+
+    base_kwargs = dict(
         model=model,
         messages=messages,
         top_p=1,
         n=1,
-        max_tokens=MAX_TOKENS,
-        temperature=temperature,
-        presence_penalty=0,
-        frequency_penalty=0,
-        logit_bias={},
         user=user,
         stream=False,
         timeout=timeout_seconds,
+    )
+    if not _is_reasoning(model):
+        base_kwargs["temperature"] = temperature
+        base_kwargs["presence_penalty"] = 0
+        base_kwargs["frequency_penalty"] = 0
+        base_kwargs["logit_bias"] = {}
+    return client.chat.completions.create(
+        **base_kwargs,
+        **token_kwarg,
     )
 
 
@@ -177,18 +187,29 @@ def start_receiving_openai_response(
             base_url=openai_api_base,
             organization=openai_organization_id,
         )
-    return client.chat.completions.create(
+
+    token_kwarg = (
+        {"max_completion_tokens": MAX_TOKENS}
+        if _is_reasoning(model)
+        else {"max_tokens": MAX_TOKENS}
+    )
+
+    base_kwargs = dict(
         model=model,
         messages=messages,
         top_p=1,
         n=1,
-        max_tokens=MAX_TOKENS,
-        temperature=temperature,
-        presence_penalty=0,
-        frequency_penalty=0,
-        logit_bias={},
         user=user,
         stream=True,
+    )
+    if not _is_reasoning(model):
+        base_kwargs["temperature"] = temperature
+        base_kwargs["presence_penalty"] = 0
+        base_kwargs["frequency_penalty"] = 0
+        base_kwargs["logit_bias"] = {}
+    return client.chat.completions.create(
+        **base_kwargs,
+        **token_kwarg,
         **kwargs,
     )
 
@@ -213,6 +234,7 @@ def consume_openai_stream_to_write_reply(
     word_count = 0
     threads = []
     function_call: Dict[str, str] = {"name": "", "arguments": ""}
+    finish_reason: Optional[str] = None
     try:
         loading_character = " ... :writing_hand:"
         for chunk in stream:
@@ -224,6 +246,7 @@ def consume_openai_stream_to_write_reply(
                 continue
             item = chunk.choices[0].model_dump()
             if item.get("finish_reason") is not None:
+                finish_reason = item.get("finish_reason")
                 break
             delta = item.get("delta")
             if delta.get("content") is not None:
@@ -302,6 +325,15 @@ def consume_openai_stream_to_write_reply(
             )
             return
 
+        # Minimal feedback when reasoning consumed all completion tokens
+        content_field = assistant_reply.get("content")
+        content_text = content_field if isinstance(content_field, str) else ""
+        if (
+            content_text.strip() == ""
+            and finish_reason == "length"
+            and _is_reasoning(context.get("OPENAI_MODEL"))
+        ):
+            assistant_reply["content"] = REASONING_EMPTY_OUTPUT_HINT
         assistant_reply_text = format_assistant_reply(
             assistant_reply["content"], translate_markdown
         )
@@ -330,72 +362,14 @@ def consume_openai_stream_to_write_reply(
 def context_length(
     model: str,
 ) -> int:
-    if model == GPT_3_5_TURBO_MODEL:
-        # Note that GPT_3_5_TURBO_MODEL may change over time. Return context length assuming GPT_3_5_TURBO_0125_MODEL.
-        return context_length(model=GPT_3_5_TURBO_0125_MODEL)
-    if model == GPT_3_5_TURBO_16K_MODEL:
-        # Note that GPT_3_5_TURBO_16K_MODEL may change over time. Return context length assuming GPT_3_5_TURBO_16K_0613_MODEL.
-        return context_length(model=GPT_3_5_TURBO_16K_0613_MODEL)
-    elif model == GPT_4_MODEL:
-        # Note that GPT_4_MODEL may change over time. Return context length assuming GPT_4_0613_MODEL.
-        return context_length(model=GPT_4_0613_MODEL)
-    elif model == GPT_4_32K_MODEL:
-        # Note that GPT_4_32K_MODEL may change over time. Return context length assuming GPT_4_32K_0613_MODEL.
-        return context_length(model=GPT_4_32K_0613_MODEL)
-    elif model == GPT_4_TURBO_PREVIEW_MODEL:
-        # Note that GPT_4_TURBO_PREVIEW_MODEL may change over time. Return context length assuming GPT_4_0125_PREVIEW_MODEL.
-        return context_length(model=GPT_4_0125_PREVIEW_MODEL)
-    elif model == GPT_4_TURBO_MODEL:
-        # Note that GPT_4_TURBO_MODEL may change over time. Return context length assuming GPT_4_TURBO_2024_04_09_MODEL.
-        return context_length(model=GPT_4_TURBO_2024_04_09_MODEL)
-    elif model == GPT_4O_MODEL:
-        # Note that GPT_4O_MODEL may change over time. Return context length assuming GPT_4O_2024_05_13_MODEL.
-        return context_length(model=GPT_4O_2024_05_13_MODEL)
-    elif model == GPT_4O_MINI_MODEL:
-        # Note that GPT_4O_MINI_MODEL may change over time. Return context length assuming GPT_4O_MINI_2024_07_18_MODEL.
-        return context_length(model=GPT_4O_MINI_2024_07_18_MODEL)
-    elif model == GPT_4_1_MODEL:
-        # Note that GPT_4_1_MODEL may change over time. Return context length assuming GPT_4_1_2025_04_14_MODEL.
-        return context_length(model=GPT_4_1_2025_04_14_MODEL)
-    elif model == GPT_4_1_MINI_MODEL:
-        # Note that GPT_4_1_MINI_MODEL may change over time. Return context length assuming GPT_4_1_MINI_2025_04_14_MODEL.
-        return context_length(model=GPT_4_1_MINI_2025_04_14_MODEL)
-    elif model == GPT_4_1_NANO_MODEL:
-        # Note that GPT_4_1_NANO_MODEL may change over time. Return context length assuming GPT_4_1_NANO_2025_04_14_MODEL.
-        return context_length(model=GPT_4_1_NANO_2025_04_14_MODEL)
-    elif model == GPT_3_5_TURBO_0301_MODEL or model == GPT_3_5_TURBO_0613_MODEL:
-        return 4096
-    elif (
-        model == GPT_3_5_TURBO_16K_0613_MODEL
-        or model == GPT_3_5_TURBO_1106_MODEL
-        or model == GPT_3_5_TURBO_0125_MODEL
-    ):
-        return 16384
-    elif model == GPT_4_0314_MODEL or model == GPT_4_0613_MODEL:
-        return 8192
-    elif model == GPT_4_32K_0314_MODEL or model == GPT_4_32K_0613_MODEL:
-        return 32768
-    elif (
-        model == GPT_4_1_MODEL
-        or model == GPT_4_1_2025_04_14_MODEL
-        or model == GPT_4_1_MINI_MODEL
-        or model == GPT_4_1_MINI_2025_04_14_MODEL
-        or model == GPT_4_1_NANO_MODEL
-        or model == GPT_4_1_NANO_2025_04_14_MODEL
-    ):
-        return 1048576
-    elif (
-        model == GPT_4_1106_PREVIEW_MODEL
-        or model == GPT_4_0125_PREVIEW_MODEL
-        or model == GPT_4_TURBO_2024_04_09_MODEL
-        or model == GPT_4O_2024_05_13_MODEL
-        or model == GPT_4O_MINI_2024_07_18_MODEL
-        or model == GPT_5_CHAT_LATEST_MODEL
-    ):
-        return 128000
-    else:
-        error = f"Calculating the length of the context window for model {model} is not yet supported."
-        raise NotImplementedError(error)
+    """Returns the context length for a given model."""
+    actual_model = resolve_model_alias(model)
+    length = MODEL_CONTEXT_LENGTHS.get(actual_model)
+    if length is not None:
+        return length
+
+    error = f"Calculating the length of the context window for model {actual_model} is not yet supported."
+    raise NotImplementedError(error)
 
 
 def encode_and_count_tokens(
@@ -420,26 +394,19 @@ def encode_and_count_tokens(
 # https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
 def calculate_num_tokens(
     messages: List[Dict[str, Union[str, Dict[str, str], List[Dict[str, str]]]]],
-    model: str = GPT_3_5_TURBO_0613_MODEL,
+    model: Optional[str] = None,
 ) -> int:
     """Returns the number of tokens used by a list of messages."""
+    actual_model = resolve_model_alias(model or DEFAULT_TOKEN_COUNT_MODEL)
     try:
-        encoding = tiktoken.encoding_for_model(model)
+        encoding = tiktoken.encoding_for_model(actual_model)
     except KeyError:
         encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = 0
 
-    # Handle model-specific tokens per message and name
-    model_tokens: Optional[Tuple[int, int]] = MODEL_TOKENS.get(model, None)
+    model_tokens = MODEL_TOKENS.get(actual_model)
     if model_tokens is None:
-        fallback_result = None
-        if model in MODEL_FALLBACKS:
-            actual_model = MODEL_FALLBACKS[model]
-            fallback_result = calculate_num_tokens(messages, model=actual_model)
-        if fallback_result is not None:
-            return fallback_result
         error = (
-            f"Calculating the number of tokens for model {model} is not yet supported. "
+            f"Calculating the number of tokens for model {actual_model} is not yet supported. "
             "See https://github.com/openai/openai-python/blob/main/chatml.md "
             "for information on how messages are converted to tokens."
         )
@@ -447,6 +414,7 @@ def calculate_num_tokens(
 
     tokens_per_message, tokens_per_name = model_tokens
 
+    num_tokens = 0
     for message in messages:
         num_tokens += tokens_per_message
         for key, value in message.items():
@@ -532,11 +500,17 @@ def calculate_tokens_necessary_for_function_call(context: BoltContext) -> int:
 
     def _calculate_prompt_tokens(functions) -> int:
         client = create_openai_client(context)
+        model = context.get("OPENAI_MODEL")
+        token_kwarg = (
+            {"max_completion_tokens": FUNCTION_CALL_TOKEN_BUDGET}
+            if _is_reasoning(model)
+            else {"max_tokens": FUNCTION_CALL_TOKEN_BUDGET}
+        )
         return client.chat.completions.create(
-            model=context.get("OPENAI_MODEL"),
+            model=model,
             messages=[{"role": "user", "content": "hello"}],
-            max_tokens=1024,
             user="system",
+            **token_kwarg,
             **({"functions": functions} if functions is not None else {}),
         ).model_dump()["usage"]["prompt_tokens"]
 
@@ -590,7 +564,16 @@ def generate_slack_thread_summary(
     )
     spent_time = time.time() - start_time
     logger.debug(f"Making a summary took {spent_time} seconds")
-    return openai_response.model_dump()["choices"][0]["message"]["content"]
+    data = openai_response.model_dump()
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
+    if (
+        content == ""
+        and choice.get("finish_reason") == "length"
+        and _is_reasoning(context.get("OPENAI_MODEL"))
+    ):
+        return REASONING_EMPTY_OUTPUT_HINT
+    return content
 
 
 def generate_proofreading_result(
@@ -643,7 +626,16 @@ def generate_proofreading_result(
     )
     spent_time = time.time() - start_time
     logger.debug(f"Proofreading took {spent_time} seconds")
-    return openai_response.model_dump()["choices"][0]["message"]["content"]
+    data = openai_response.model_dump()
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
+    if (
+        content == ""
+        and choice.get("finish_reason") == "length"
+        and _is_reasoning(context.get("OPENAI_MODEL"))
+    ):
+        return REASONING_EMPTY_OUTPUT_HINT
+    return content
 
 
 def generate_chatgpt_response(
@@ -682,7 +674,16 @@ def generate_chatgpt_response(
     )
     spent_time = time.time() - start_time
     logger.debug(f"Proofreading took {spent_time} seconds")
-    return openai_response.model_dump()["choices"][0]["message"]["content"]
+    data = openai_response.model_dump()
+    choice = data["choices"][0]
+    content = (choice["message"].get("content") or "").strip()
+    if (
+        content == ""
+        and choice.get("finish_reason") == "length"
+        and _is_reasoning(context.get("OPENAI_MODEL"))
+    ):
+        return REASONING_EMPTY_OUTPUT_HINT
+    return content
 
 
 def create_openai_client(context: BoltContext) -> Union[OpenAI, AzureOpenAI]:
